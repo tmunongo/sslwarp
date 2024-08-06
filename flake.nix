@@ -1,9 +1,15 @@
 {
   description = "A Nix-flake-based Go 1.22 development environment";
 
-  inputs.nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1.*.tar.gz";
+  inputs = {
+    nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1.*.tar.gz";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       goVersion = 22; # Change this to update the whole stack
 
@@ -11,13 +17,25 @@
       forEachSupportedSystem = f: nixpkgs.lib.genAttrs supportedSystems (system: f {
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ self.overlays.default ];
+          overlays = [ rust-overlay.overlays.default self.overlays.default ];
         };
       });
     in
     {
       overlays.default = final: prev: {
         go = final."go_1_${toString goVersion}";
+        rustToolchain =
+          let
+            rust = prev.rust-bin;
+          in
+          if builtins.pathExists ./rust-toolchain.toml then
+            rust.fromRustupToolchainFile ./rust-toolchain.toml
+          else if builtins.pathExists ./rust-toolchain then
+            rust.fromRustupToolchainFile ./rust-toolchain
+          else
+            rust.stable.latest.default.override {
+              extensions = [ "rust-src" "rustfmt" ];
+            };
       };
 
       devShells = forEachSupportedSystem ({ pkgs }: {
@@ -33,7 +51,21 @@
             golangci-lint
 
             air
+
+            # rust
+            rustToolchain
+            openssl
+            pkg-config
+            cargo-deny
+            cargo-edit
+            cargo-watch
+            rust-analyzer
           ];
+
+          env = {
+            # Required by rust-analyzer
+            RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
+          };
         };
       });
     };
