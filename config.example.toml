@@ -1,0 +1,7 @@
+api_key = "1234"
+
+[tunnels.<name>]
+name = "<name>"
+domain = "<name>.sslwarp.com"
+proto = "http"
+addr = 5000

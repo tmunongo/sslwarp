@@ -1,7 +1,0 @@
-api_key: 1234
-tunnels:
-  nextcloud:
-    name: nextcloud
-    domain: nextcloud.sslwarp.com
-    proto: http
-    addr: 5000

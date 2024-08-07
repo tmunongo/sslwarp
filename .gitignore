@@ -1,5 +1,6 @@
 .env
 tmp/
+config.toml
 
 # Added by cargo
 
