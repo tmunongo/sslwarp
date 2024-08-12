@@ -1,32 +1,29 @@
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
-struct Config {
-    api_key: String,
-    tunnels: Vec<TunnelConfig>
+pub struct Config {
+    pub api_key: String,
+    pub tunnels: Vec<TunnelConfig>
 }
 
 #[derive(Deserialize, Debug)]
-struct TunnelConfig {
-    name: String,
-    addr: int,
-    proto: String,
-    domain: String,
+pub struct TunnelConfig {
+    pub name: String,
+    pub addr: u16,
+    pub proto: String,
+    pub domain: String,
 }
 
-// pub mod config {
-    use std::fs;
+use std::fs;
 
-    pub fn load(path: String) -> Result<T, E> {
-        let file = fs::read_to_string(path).expect("Config file is required to run in client mode.");
+pub fn load(path: String) -> Result<Config, Box<dyn std::error::Error>> {
+    let file = fs::read_to_string(path).expect("Config file is required to run in client mode.");
 
-        // use match to handle error is read_to_string returns an Option
-        let config: Config = toml::from_str(&file)?;
+    // use match to handle error is read_to_string returns an Option
+    let config: Config = toml::from_str(&file).unwrap();
 
-        println!("config: {}", config);
+    println!("key: {}", config.api_key);
+    // println!("tunnels: {:?}", config.tunnels);
 
-        Ok(config)
-
-        // wrangle the yaml
-    }
-// }
+    Ok(config)
+}

@@ -1,11 +1,11 @@
-use tokio;
+use client::client::Client;
+use config::config::load;
+// use tokio;
 use clap::Parser;
 use dotenv;
-use crate::config::config::config::load;
-use crate::server::server::server::new;
 
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(author, version, about, long_about = None)]
 struct Args {
     // Mode to run sslwarp in
     #[arg(short, long)]
@@ -16,11 +16,12 @@ struct Args {
     config: String,
 }
 
+mod client;
 mod server;
 mod config;
 
 #[tokio::main]
-fn main() {
+async fn main() {
     dotenv::dotenv().ok();
 
     let args = Args::parse();
@@ -32,10 +33,12 @@ fn main() {
     }
 }
 
-async fn run_server() {
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     println!("SSLWarp is listening on port :8000");
 
-    let _server = new();
+    let server = Server::new();
+
+    server.run().await
 }
 
 async fn run_client(path: String) {
@@ -44,7 +47,7 @@ async fn run_client(path: String) {
     let config = load(path);
 
     match config {
-        Ok(config) => crate::client::new(config).await,
-        Err(error) => println!("Failed to start client with config error: {}", error)
+        Ok(config) => Client::new(config).await,
+        Err(_error) => println!("Failed to start client with config error")
     }
 }
