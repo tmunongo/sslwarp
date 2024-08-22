@@ -78,7 +78,7 @@ async fn establish_tunnel(mut stream: TcpStream, tunnels: Arc<Mutex<HashMap<Stri
             Ok(0) | Err(_) => {
                 println!("Tunnel {} closed", tunnel_id);
                 tunnels.lock().await.remove(&tunnel_id);
-                Ok(())
+                Ok()
             }
             Ok(_) => continue,
         }
@@ -93,7 +93,7 @@ async fn handle_client_request(mut client_stream: TcpStream, tunnels: Arc<Mutex<
         return Ok(());
     }
 
-    let mut tunnels = tunnels.lock().await?;
+    let mut tunnels = tunnels.lock().await;
     let tunnel_stream = match tunnels.get_mut(tunnel_id) {
         Some(stream) => stream.try_clone().await?,
         None => {
