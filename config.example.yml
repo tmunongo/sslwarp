@@ -1,0 +1,7 @@
+api_key: 123
+tunnels:
+  service:
+    name: service
+    domain: service
+    proto: "http"
+    addr: 5000

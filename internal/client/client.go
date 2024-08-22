@@ -52,7 +52,7 @@ func (c *Client) establishAndMaintainTunnel() error {
 	// connect to server
 	conn, err := net.Dial("tcp", ServerAddr)
 	if err != nil {
-		return fmt.Errorf("Failed to connect to the server: %w", err)
+		return fmt.Errorf("failed to connect to the server: %w", err)
 	}
 	defer conn.Close()
 
@@ -87,30 +87,82 @@ func (c *Client) establishAndMaintainTunnel() error {
 }
 
 func (c *Client) handleTunnel(serverConn net.Conn) error {
-	localConn, err := net.Dial("tcp", fmt.Sprintf("%s", c.config.Tunnels["Addr"]))
-	if err != nil {
-		return fmt.Errorf("Failed to collect to local service: %w", err)
+	for {
+		var request struct {
+			ServiceName string `json:"service_name"`
+		}
+
+		if err := json.NewDecoder(serverConn).Decode(&request); err != nil {
+			if err == io.EOF {
+				return fmt.Errorf("remote closed the connection")
+			}
+			return fmt.Errorf("failed to read server request %w", err)
+		}
+
+		tunnelConfig, ok := c.config.Tunnels[request.ServiceName]
+		if !ok {
+			log.Printf("warning, received request for unknown service %s", request.ServiceName)
+			continue
+		}
+
+		localAddr := fmt.Sprintf("%s.local:%s", tunnelConfig.Domain, tunnelConfig.Proto)
+		localConn, err := net.Dial("tcp", localAddr)
+		if err != nil {
+			log.Printf("failed to connect to local service %s, %v", request.ServiceName, err)
+			continue
+		}
+
+		go c.handleConnection(serverConn, localConn)
 	}
+}
+
+func (c *Client) handleConnection(serverConn net.Conn, localConn net.Conn) {
 	defer localConn.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Server to local
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(localConn, serverConn); err != nil {
-			log.Printf("Error in server -> local: %v", err)
+			log.Printf("error in server -> local: %v", err)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		if _, err := io.Copy(serverConn, localConn); err != nil {
-			log.Printf("Error in local -> tunnel: %v", err)
+			log.Printf("error in local -> server: %v", err)
 		}
 	}()
-
-	wg.Wait()
-	return nil
 }
+
+// func (c *Client) handleTunnelOld(serverConn net.Conn) error {
+// 	// log.Println(serverConn.)
+// 	localConn, err := net.Dial("tcp", fmt.Sprintf("%s", c.config.Tunnels["Proto"]))
+// 	if err != nil {
+// 		return fmt.Errorf("failed to collect to local service: %w", err)
+// 	}
+// 	defer localConn.Close()
+
+// 	var wg sync.WaitGroup
+// 	wg.Add(2)
+
+// 	// Server to local
+// 	go func() {
+// 		defer wg.Done()
+// 		if _, err := io.Copy(localConn, serverConn); err != nil {
+// 			log.Printf("Error in server -> local: %v", err)
+// 		}
+// 	}()
+
+// 	go func() {
+// 		defer wg.Done()
+// 		if _, err := io.Copy(serverConn, localConn); err != nil {
+// 			log.Printf("Error in local -> tunnel: %v", err)
+// 		}
+// 	}()
+
+// 	wg.Wait()
+// 	return nil
+// }

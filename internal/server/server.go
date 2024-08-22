@@ -1,10 +1,14 @@
 package server
 
 import (
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -12,9 +16,29 @@ import (
 
 type Server struct {
 	//
-	listener net.Listener
-	tunnels map[string]net.Conn
+	httpsListener net.Listener
+	httpListener net.Listener
+	tunnels map[string]*ClientTunnel
+	subdomainMap map[string]string
 	mu sync.Mutex
+	tlsConfig *tls.Config
+}
+
+type ClientTunnel struct {
+	conn net.Conn
+	services map[string]ServiceConfig
+}
+
+type ServiceConfig struct {
+	Name string
+	Domain string
+	Proto string
+	Port int
+}
+
+type TunnelRequest struct {
+	APIKey string `json:"api_key"`
+	Tunnels map[string]ServiceConfig `json:"tunnels"`
 }
 
 type ReceivedRequest struct {
@@ -24,28 +48,63 @@ type ReceivedRequest struct {
 	Message string
 }
 
+type RequestResponse struct {
+	Tunnel_ID string
+	Error string
+}
+
 func New() *Server {
 	return &Server{
-		tunnels: make(map[string]net.Conn),
+		tunnels: make(map[string]*ClientTunnel),
+		subdomainMap: make(map[string]string),
 	}
 }
 
 func (s *Server) Run() error {
-	listener, err := net.Listen("tcp", ":8080")
+	var err error
+
+	// establish http listener
+	s.httpListener, err = net.Listen("tcp", ":80")
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to start http listener: %w", err)
+	}
+	defer s.httpListener.Close()
+
+	s.httpsListener, err = net.Listen("tcp", ":443")
+	if err != nil {
+		return fmt.Errorf("failed to start https listener: %w", err)
+	}
+	defer s.httpsListener.Close()
+
+	// load tls cert
+	cert, err := tls.LoadX509KeyPair("certs/example.pem", "certs/example.crt")
+	if err != nil {
+		return fmt.Errorf("failed to load tls certificates %w", cert)
 	}
 
-	s.listener = listener
-	defer s.listener.Close()
+	s.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
 
-	log.Println("Server is listening on port :8080")
+	log.Println("Server is listening on ports 80 (HTTP) and 443 (HTTPS)")
+
+	// tunnel listener on separate port
+	tunnelListener, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		return fmt.Errorf("failed to start tunnel lsitener: %w", err)
+	}
+	defer tunnelListener.Close()
+
+	log.Println("Tunnel listener is listening on port 80")
+
+	// TODO: start virtual host servers
+	go s.listenAndServeVirtualHosts()
 
 	// infinite loop to listen for connections
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := tunnelListener.Accept()
 		if err != nil {
-			log.Printf("Error accepting connections: %v", err)
+			log.Printf("Error accepting tunnel connections: %v", err)
 			continue
 		}
 
@@ -53,6 +112,61 @@ func (s *Server) Run() error {
 		go s.handleConnection(conn)
 	}
 }
+
+func (s *Server) handleHTTPS(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	subdomain := strings.Split(host, ".")[0]
+
+	s.mu.Lock()
+	tunnelID, exists := s.subdomainMap[subdomain]
+	s.mu.Unlock()
+
+	if !exists {
+		http.Error(w, "Tunnel not found", http.StatusNotFound)
+		return
+	}
+
+	s.mu.Lock()
+	clientTunnel, exists := s.tunnels[tunnelID]
+	s.mu.Unlock()
+
+	var service ServiceConfig
+	for _, svc := range clientTunnel.services {
+		if svc.Domain == subdomain {
+			service = svc
+			break
+		}
+	}
+
+	if service.Name == "" {
+		http.Error(w, "Service not found for the subdomain", http.StatusNotFound)
+		return
+	}
+
+	// notify the client of the new connection
+	s.notifyNewConnection(clientTunnel, service)
+
+	// create a new connection to handle this request
+	clientConn, serverConn := net.Pipe()
+	go s.handleFullDuplexCommunication(serverConn, clientTunnel.conn)
+
+	// TODO: forward the request to the client
+	s.forwardRequest(w, r, clientConn)
+}
+
+func (s *Server) notifyNewConnection(clientTunnel *ClientTunnel, service ServiceConfig) {
+	notification := struct {
+		Type string `json:"type"`
+		Service ServiceConfig `json:"service"`
+	}{
+		Type: "new_connection",
+		Service: service,
+	}
+
+	json.NewEncoder(clientTunnel.conn).Encode(&notification)
+}
+
+
 
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
@@ -74,6 +188,13 @@ func (s *Server) handleConnection(conn net.Conn) {
         return
     }
 
+	if clientRequest.Api_key == "" {
+        log.Println("Missing API key in tunnel request")
+        return
+    }
+
+    // TODO: Validate API key
+
 	// this is empty for some reason, must fix
 	log.Printf("Received request %v", clientRequest)
 
@@ -86,18 +207,37 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) establishTunnel(conn net.Conn) {
+	var request TunnelRequest
+	if err := json.NewDecoder(conn).Decode(&request); err != nil {
+		log.Printf("error decoding tunnel request %v", err)
+		conn.Close()
+		return
+	}
+
 	tunnelID := generateUniqueID();
 
+	clientTunnel := &ClientTunnel{
+		conn: conn,
+		services: request.Tunnels,
+	}
+
 	s.mu.Lock()
-	s.tunnels[tunnelID] = conn
+	s.tunnels[tunnelID] = clientTunnel
+	for _, service := range request.Tunnels {
+		s.subdomainMap[service.Domain] = tunnelID
+	}
 	s.mu.Unlock()
 
 	log.Printf("Connection established with ID: %s", tunnelID)
 
 	// send tunnelID back
-	err := json.NewEncoder(conn).Encode(tunnelID)
+	response := RequestResponse {
+		Tunnel_ID: tunnelID,
+		Error: "",
+	}
+	err := json.NewEncoder(conn).Encode(response)
 	if err != nil {
-		log.Println("Failed to encode JSON to connection: %v", err)
+		log.Println("failed to encode JSON to connection: %v", err)
 	}
 	// conn.Write([]byte(tunnelID))
 
@@ -112,6 +252,11 @@ func (s *Server) establishTunnel(conn net.Conn) {
 
 			s.mu.Lock()
 			delete(s.tunnels, tunnelID)
+			for domain, id := range s.subdomainMap {
+				if id == tunnelID {
+					delete(s.subdomainMap, domain)
+				}
+			}
 			s.mu.Unlock()
 			return
 		}
@@ -153,7 +298,7 @@ func (s *Server) handleClientRequest(conn net.Conn, msg string) {
 		return
 	}
 
-	s.handleFullDuplexCommunication(conn, tunnelConn)	
+	s.handleFullDuplexCommunication(conn, tunnelConn.conn)	
 }
 
 func (s *Server) handleFullDuplexCommunication(clientConn, tunnelConn net.Conn) {
