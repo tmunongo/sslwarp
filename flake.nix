@@ -5,7 +5,7 @@
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1.*.tar.gz";
   };
 
-  outputs = { self, nixpkgs, rust-overlay }:
+  outputs = { self, nixpkgs }:
     let
       goVersion = 22; # Change this to update the whole stack
 
