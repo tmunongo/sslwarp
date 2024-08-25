@@ -14,7 +14,7 @@ import (
 
 const (
 	// possible use env variables
-	// ServerAddr = "api.webbe.dev:443"
+	// ServerAddr = "api.sslwarp.com:443"
 	ServerAddr = "localhost:8080"
 )
 
@@ -32,8 +32,7 @@ func New(cfg *config.Config) (*Client, error) {
 
 type TunnelRequest struct {
 	APIKey string `json:"api_key"`
-	Subdomain string `json:"subdomain"`
-	LocalAddr string `json:"local_addr"`
+	Tunnels map[string]config.TunnelConfig `json:"tunnels"`
 	Message string `json:"message"`
 }
 
@@ -54,13 +53,14 @@ func (c *Client) establishAndMaintainTunnel() error {
 	if err != nil {
 		return fmt.Errorf("failed to connect to the server: %w", err)
 	}
-	defer conn.Close()
+	// defer conn.Close()
+
+	log.Printf("config tunnels: %v", c.config.Tunnels)
 
 	request := TunnelRequest{
         APIKey: c.config.ApiKey,
 		Message: "TUNNEL_REQUEST",
-        Subdomain: fmt.Sprintf("%s", c.config.Tunnels["Addr"]),
-        LocalAddr: fmt.Sprintf("%s:%d", c.config.Tunnels["Domain"], c.config.Tunnels["Proto"]),
+		Tunnels: c.config.Tunnels,
     }
 
 	if err := json.NewEncoder(conn).Encode(request); err != nil {
@@ -69,6 +69,7 @@ func (c *Client) establishAndMaintainTunnel() error {
 
 	// current error happens with reading the tunnel id in the response here
 	var response struct {
+
 		TunnelID string `json:"tunnel_id"`
 		Error string `json:"error",omitempty`
 	}
@@ -86,10 +87,17 @@ func (c *Client) establishAndMaintainTunnel() error {
 	return c.handleTunnel(conn)	
 }
 
+type ServiceConfig struct {
+	Name string
+	Domain string
+	Proto string
+	Addr int
+}
+
 func (c *Client) handleTunnel(serverConn net.Conn) error {
 	for {
 		var request struct {
-			ServiceName string `json:"service_name"`
+			Service ServiceConfig `json:"service"`
 		}
 
 		if err := json.NewDecoder(serverConn).Decode(&request); err != nil {
@@ -99,16 +107,18 @@ func (c *Client) handleTunnel(serverConn net.Conn) error {
 			return fmt.Errorf("failed to read server request %w", err)
 		}
 
-		tunnelConfig, ok := c.config.Tunnels[request.ServiceName]
+		log.Printf("service name: %s", request.Service.Name)
+
+		tunnelConfig, ok := c.config.Tunnels[request.Service.Name]
 		if !ok {
-			log.Printf("warning, received request for unknown service %s", request.ServiceName)
+			log.Printf("warning, received request for unknown service %s", request.Service.Name)
 			continue
 		}
 
-		localAddr := fmt.Sprintf("%s.local:%s", tunnelConfig.Domain, tunnelConfig.Proto)
+		localAddr := fmt.Sprintf("%s.sslwarp.local:%s", tunnelConfig.Domain, tunnelConfig.Proto)
 		localConn, err := net.Dial("tcp", localAddr)
 		if err != nil {
-			log.Printf("failed to connect to local service %s, %v", request.ServiceName, err)
+			log.Printf("failed to connect to local service %s, %v", request.Service.Name, err)
 			continue
 		}
 

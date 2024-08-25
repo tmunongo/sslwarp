@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -33,11 +34,12 @@ type ServiceConfig struct {
 	Name string
 	Domain string
 	Proto string
-	Port int
+	Addr int
 }
 
 type TunnelRequest struct {
 	APIKey string `json:"api_key"`
+	Message string `json:"message"`
 	Tunnels map[string]ServiceConfig `json:"tunnels"`
 }
 
@@ -46,6 +48,7 @@ type ReceivedRequest struct {
 	Subdomain string
 	Local_addr string
 	Message string
+	Tunnels map[string]ServiceConfig
 }
 
 type RequestResponse struct {
@@ -77,9 +80,9 @@ func (s *Server) Run() error {
 	defer s.httpsListener.Close()
 
 	// load tls cert
-	cert, err := tls.LoadX509KeyPair("certs/example.pem", "certs/example.crt")
+	cert, err := tls.LoadX509KeyPair("certs/server.crt", "certs/server.key")
 	if err != nil {
-		return fmt.Errorf("failed to load tls certificates %w", cert)
+		return fmt.Errorf("failed to load tls certificates %w", err)
 	}
 
 	s.tlsConfig = &tls.Config{
@@ -95,9 +98,8 @@ func (s *Server) Run() error {
 	}
 	defer tunnelListener.Close()
 
-	log.Println("Tunnel listener is listening on port 80")
+	log.Println("Tunnel listener is listening on port 8080")
 
-	// TODO: start virtual host servers
 	go s.listenAndServeVirtualHosts()
 
 	// infinite loop to listen for connections
@@ -111,6 +113,38 @@ func (s *Server) Run() error {
 		// spawn a go routine to handle the connection
 		go s.handleConnection(conn)
 	}
+}
+
+func (s *Server) listenAndServeVirtualHosts() {
+	// HTTP server
+	go func() {
+		httpSrv := &http.Server{
+			Addr: ":80",
+			Handler: http.HandlerFunc(s.handleHTTP),
+		}
+		if err := httpSrv.Serve(s.httpListener); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server error: %v", err)
+		}
+	}()
+
+	httpSrv := &http.Server{
+		Addr: ":443",
+		TLSConfig: s.tlsConfig,
+		Handler: http.HandlerFunc(s.handleHTTPS),
+	}
+	if err := httpSrv.ServeTLS(s.httpsListener, "", ""); err != nil && err != http.ErrServerClosed {
+		log.Printf("HTTPS server error: %v", err)
+	}
+}
+
+func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// upgrade HTTP to HTTPS
+	host := r.Host
+	if host == "" {
+		http.Error(w, "missing host header", http.StatusBadRequest)
+		return
+	}
+	http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
 }
 
 func (s *Server) handleHTTPS(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +188,45 @@ func (s *Server) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 	s.forwardRequest(w, r, clientConn)
 }
 
+func (s *Server) forwardRequest(w http.ResponseWriter, r *http.Request, clientConnection net.Conn) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return clientConnection, nil
+			},
+		},
+	}
+
+	outReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	if err != nil {
+		http.Error(w, "error creating forwarded request", http.StatusInternalServerError)
+		return
+	}
+
+	// set x-forwarded for header
+	if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err != nil {
+		if prior, ok := outReq.Header["X-Forwarded-For"]; ok {
+			clientIP = strings.Join(prior, ", ") + ", " + clientIP
+		}
+		outReq.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := client.Do(outReq)
+	if err != nil {
+		http.Error(w, "error forwarding request", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+
+	w.WriteHeader(resp.StatusCode)
+
+	io.Copy(w, resp.Body)
+}
+
 func (s *Server) notifyNewConnection(clientTunnel *ClientTunnel, service ServiceConfig) {
 	notification := struct {
 		Type string `json:"type"`
@@ -195,35 +268,27 @@ func (s *Server) handleConnection(conn net.Conn) {
 
     // TODO: Validate API key
 
-	// this is empty for some reason, must fix
-	log.Printf("Received request %v", clientRequest)
-
-	if clientRequest.Message == "TUNNEL_REQUEST" {
-		log.Println("Establishing")
-		s.establishTunnel(conn)
+    // Check if the message starts with "TUNNEL_REQUEST"
+    if (clientRequest.Message == "TUNNEL_REQUEST") {
+		s.establishTunnel(conn, *clientRequest)
 	} else {
 		s.handleClientRequest(conn, clientRequest.Message)
 	}
 }
 
-func (s *Server) establishTunnel(conn net.Conn) {
-	var request TunnelRequest
-	if err := json.NewDecoder(conn).Decode(&request); err != nil {
-		log.Printf("error decoding tunnel request %v", err)
-		conn.Close()
-		return
-	}
-
+func (s *Server) establishTunnel(conn net.Conn, clientRequest ReceivedRequest) {
 	tunnelID := generateUniqueID();
+
+	log.Printf("Tunnels: %v", clientRequest.Tunnels)
 
 	clientTunnel := &ClientTunnel{
 		conn: conn,
-		services: request.Tunnels,
+		services: clientRequest.Tunnels,
 	}
 
 	s.mu.Lock()
 	s.tunnels[tunnelID] = clientTunnel
-	for _, service := range request.Tunnels {
+	for _, service := range clientRequest.Tunnels {
 		s.subdomainMap[service.Domain] = tunnelID
 	}
 	s.mu.Unlock()

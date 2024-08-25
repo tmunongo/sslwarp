@@ -1,5 +1,6 @@
 .env
 tmp/
+certs/*
 config.toml
 config.yml
 

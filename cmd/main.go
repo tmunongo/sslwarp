@@ -31,7 +31,7 @@ func main() {
 }
 
 func runServer() {
-	fmt.Println("SSLWarp is listening on port :8000")
+	fmt.Println("SSLWarp is listening on port :8080")
 
 	srv := server.New()
 	 
