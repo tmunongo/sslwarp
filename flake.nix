@@ -35,6 +35,9 @@
             golangci-lint
 
             air
+
+            templ
+            tailwindcss
           ];
         };
       });

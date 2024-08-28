@@ -1,0 +1,31 @@
+package home
+
+import (
+	"github.com/tmunongo/sslwarp/views/layouts"
+)
+
+templ Index() {
+	@layouts.Base() {
+		<main class="flex min-h-screen items-center justify-center font-sans">
+			<div class="flex flex-col justify-around items-center gap-4 md:w-1/2 w-4/5">
+				<h1 class="text-3xl">Coming soon</h1>
+				<h3 class="text-xl text-center">
+				We&apos;re a software development team committed to building custom
+				solutions to cater for your business needs.
+				</h3>
+				<div class="flex items-center">
+				<input
+					accept="email"
+					type="email"
+					placeholder="joedoe@example.com"
+					class="p-2 rounded-l-md text-black"
+				/>
+				<button class="rounded-r-md p-2 bg-[#193f98]">Register</button>
+				</div>
+				<p class="text-center">
+				Send us your email to register your interest and we will get in touch.
+				</p>
+			</div>
+		</main>
+	}
+}

@@ -3,6 +3,11 @@ tmp/
 certs/*
 config.toml
 config.yml
+.direnv
+
+# compiled assets
+*_templ.go
+public
 
 # Added by cargo
 

@@ -9,6 +9,7 @@ import (
 	"github.com/tmunongo/sslwarp/internal/client"
 	"github.com/tmunongo/sslwarp/internal/config"
 	"github.com/tmunongo/sslwarp/internal/server"
+	"github.com/tmunongo/sslwarp/internal/web"
 )
 
 func main() {
@@ -24,8 +25,10 @@ func main() {
 	flag.Parse()
 
 	if *serverMode {
+		web.StartWeb("server")
 		runServer()
 	} else {
+		web.StartWeb("client")
 		runClient(*configFile)
 	}
 }
