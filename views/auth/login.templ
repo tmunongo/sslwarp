@@ -1,7 +1,11 @@
 package auth
 
+import "github.com/tmunongo/sslwarp/views/layouts"
+
 templ Login() {
-    <div class="bg-black">
-        Welcome to SSL Warp. Please log in, admin
-    </div>
+    @layouts.Base() {
+        <div>
+            Welcome to SSL Warp. Please log in, admin
+        </div>
+    }
 }
