@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/tmunongo/sslwarp/internal/client"
@@ -24,16 +30,55 @@ func main() {
 
 	flag.Parse()
 
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
 	if *serverMode {
-		web.StartWeb("server")
-		runServer()
+		wg.Add(2)
+		go func ()  {
+			defer wg.Done()
+			runServer(ctx)
+		}()
+		go func ()  {
+			defer wg.Done()
+			web.StartWeb(ctx, "server")
+		}()
 	} else {
-		web.StartWeb("client")
-		runClient(*configFile)
+		wg.Add(2)
+		go func ()  {
+			defer wg.Done()
+			runClient(ctx, *configFile)
+		}()
+		go func ()  {
+			defer wg.Done()
+			web.StartWeb(ctx, "client")
+		}()
 	}
+
+	// Wait for interrupt signal
+    <-sigChan
+    log.Println("Received interrupt signal. Shutting down...")
+    cancel()
+
+    // Wait for goroutines to finish with a timeout
+    waitChan := make(chan struct{})
+    go func() {
+        wg.Wait()
+        close(waitChan)
+    }()
+
+    select {
+    case <-waitChan:
+        log.Println("Graceful shutdown completed")
+    case <-time.After(10 * time.Second):
+        log.Println("Forced shutdown after timeout")
+    }
 }
 
-func runServer() {
+func runServer(ctx context.Context) {
 	fmt.Println("SSLWarp is listening on port :8080")
 
 	srv := server.New()
@@ -43,7 +88,7 @@ func runServer() {
 	}
 }
 
-func runClient(configPath string) {
+func runClient(ctx context.Context, configPath string) {
 	fmt.Println("SSLWarp is running in client mode")
 
 	cfg, err := config.Load(configPath)

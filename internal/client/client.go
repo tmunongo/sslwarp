@@ -67,7 +67,6 @@ func (c *Client) establishAndMaintainTunnel() error {
 		return fmt.Errorf("failed to send tunnel request: %w", err)
 	}
 
-	// current error happens with reading the tunnel id in the response here
 	var response struct {
 
 		TunnelID string `json:"tunnel_id"`
@@ -95,6 +94,8 @@ type ServiceConfig struct {
 }
 
 func (c *Client) handleTunnel(serverConn net.Conn) error {
+	defer serverConn.Close()
+
 	for {
 		var request struct {
 			Service ServiceConfig `json:"service"`
@@ -123,7 +124,11 @@ func (c *Client) handleTunnel(serverConn net.Conn) error {
 		}
 
 		go c.handleConnection(serverConn, localConn)
+
+		break
 	}
+
+	return nil
 }
 
 func (c *Client) handleConnection(serverConn net.Conn, localConn net.Conn) {
@@ -132,47 +137,31 @@ func (c *Client) handleConnection(serverConn net.Conn, localConn net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	go func() {
+	copy := func (dst, src net.Conn)  {
 		defer wg.Done()
-		if _, err := io.Copy(localConn, serverConn); err != nil {
-			log.Printf("error in server -> local: %v", err)
-		}
-	}()
 
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(serverConn, localConn); err != nil {
-			log.Printf("error in local -> server: %v", err)
+		_, err := io.Copy(dst, src)
+		if err != nil {
+			if err != io.EOF && !isConnectionClosed(err) {
+				log.Printf("error in connection: %v", err)
+			}
 		}
-	}()
+		dst.Close()
+		src.Close()
+	}
+
+	go copy(localConn, serverConn)
+	go copy(serverConn, localConn)
+
+	wg.Wait()
 }
 
-// func (c *Client) handleTunnelOld(serverConn net.Conn) error {
-// 	// log.Println(serverConn.)
-// 	localConn, err := net.Dial("tcp", fmt.Sprintf("%s", c.config.Tunnels["Proto"]))
-// 	if err != nil {
-// 		return fmt.Errorf("failed to collect to local service: %w", err)
-// 	}
-// 	defer localConn.Close()
-
-// 	var wg sync.WaitGroup
-// 	wg.Add(2)
-
-// 	// Server to local
-// 	go func() {
-// 		defer wg.Done()
-// 		if _, err := io.Copy(localConn, serverConn); err != nil {
-// 			log.Printf("Error in server -> local: %v", err)
-// 		}
-// 	}()
-
-// 	go func() {
-// 		defer wg.Done()
-// 		if _, err := io.Copy(serverConn, localConn); err != nil {
-// 			log.Printf("Error in local -> tunnel: %v", err)
-// 		}
-// 	}()
-
-// 	wg.Wait()
-// 	return nil
-// }
+func isConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if opErr, ok := err.(*net.OpError); ok {
+		return opErr.Err.Error() == "use of closed network connection"
+	}
+	return false
+}

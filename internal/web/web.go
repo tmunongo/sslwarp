@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -12,7 +13,7 @@ import (
 // go:embed public/*
 // var static embed.FS
 
-func StartWeb(mode string) {
+func StartWeb(ctx context.Context, mode string) {
 	r := mux.NewRouter();
 
 	wd, err := os.Getwd()

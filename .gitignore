@@ -4,6 +4,7 @@ certs/*
 config.toml
 config.yml
 .direnv
+bin/*
 
 # compiled assets
 *_templ.go

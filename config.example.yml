@@ -4,4 +4,4 @@ tunnels:
     name: service
     domain: service
     proto: "http"
-    addr: 5000
+    addr: 8000

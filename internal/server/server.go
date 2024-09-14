@@ -184,7 +184,6 @@ func (s *Server) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 	clientConn, serverConn := net.Pipe()
 	go s.handleFullDuplexCommunication(serverConn, clientTunnel.conn)
 
-	// TODO: forward the request to the client
 	s.forwardRequest(w, r, clientConn)
 }
 
@@ -302,7 +301,7 @@ func (s *Server) establishTunnel(conn net.Conn, clientRequest ReceivedRequest) {
 	}
 	err := json.NewEncoder(conn).Encode(response)
 	if err != nil {
-		log.Println("failed to encode JSON to connection: %v", err)
+		log.Printf("failed to encode JSON to connection: %v", err)
 	}
 	// conn.Write([]byte(tunnelID))
 
@@ -367,35 +366,71 @@ func (s *Server) handleClientRequest(conn net.Conn, msg string) {
 }
 
 func (s *Server) handleFullDuplexCommunication(clientConn, tunnelConn net.Conn) {
-	defer clientConn.Close()
-	defer tunnelConn.Close()
-
 	var wg sync.WaitGroup
 	wg.Add(2)
+
+	// Create a channel to signal when it's time to close connections
+	done := make(chan struct{})
 
 	// client to tunnel
 	go func() {
 		defer wg.Done()
-		if err := s.pipe(tunnelConn, clientConn); err != nil {
-			log.Printf("Error in client -> tunnel: %v", err)
-		}
+		s.pipe(tunnelConn, clientConn, "client -> tunnel", done)
 	}()
 
 	// tunnel to client
 	go func() {
 		defer wg.Done()
-		if err := s.pipe(clientConn, tunnelConn); err != nil {
-			log.Printf("Error in tunnel -> client: %v", err)
-		}
+		s.pipe(clientConn, tunnelConn, "tunnel -> client", done)
 	}()
 
+	// Wait for both directions to complete
 	wg.Wait()
+
+	// Close the connections after both directions are done
+	clientConn.Close()
+	tunnelConn.Close()
 	log.Println("Client request handled!")
 }
 
-func (s *Server) pipe(dst, src net.Conn) error {
-	_, err := io.Copy(dst, src)
-	return err
+func (s *Server) pipe(dst, src net.Conn, direction string, done chan struct{}) {
+	defer func() {
+		select {
+		case <-done:
+			// Channel is already closed, do nothing
+		default:
+			close(done)
+		}
+	}()
+
+	buf := make([]byte, 32*1024) // 32KB buffer
+	for {
+		nr, err := src.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading in %s: %v", direction, err)
+			}
+			break
+		}
+		if nr > 0 {
+			nw, err := dst.Write(buf[0:nr])
+			if err != nil {
+				log.Printf("Error writing in %s: %v", direction, err)
+				break
+			}
+			if nw != nr {
+				log.Printf("Error: short write in %s", direction)
+				break
+			}
+		}
+
+		select {
+		case <-done:
+			return
+		default:
+			// Continue the loop
+		}
+	}
 }
 
 func (s *Server) extractTunnelID(message string) (string, error) {
