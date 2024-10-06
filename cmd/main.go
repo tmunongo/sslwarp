@@ -79,7 +79,7 @@ func main() {
 }
 
 func runServer(ctx context.Context) {
-	fmt.Println("SSLWarp is listening on port :8080")
+	fmt.Println("SSLWarp is listening in server mode")
 
 	srv := server.New()
 	 
