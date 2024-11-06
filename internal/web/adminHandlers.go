@@ -1,11 +1,9 @@
 package web
 
 import (
-	"context"
 	"io"
 	"net/http"
-
-	"github.com/tmunongo/sslwarp/views/auth"
+	// "github.com/tmunongo/sslwarp/views/auth"
 )
 
 func HandleAdminHealth(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +17,7 @@ func HandleAdminHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func HandleAdminLogin(w http.ResponseWriter, r *http.Request) {
-	component := auth.Login()
+	// component := auth.Login()
 
-	component.Render(context.Background(), w)
+	// component.Render(context.Background(), w)
 }

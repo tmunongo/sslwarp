@@ -4,13 +4,17 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -26,8 +30,12 @@ type Server struct {
 }
 
 type ClientTunnel struct {
-	conn net.Conn
-	services map[string]ServiceConfig
+    conn      net.Conn
+    services  map[string]ServiceConfig
+    lastPing  time.Time
+    closed    atomic.Bool
+    closeOnce sync.Once
+    done      chan struct{}
 }
 
 type ServiceConfig struct {
@@ -87,6 +95,8 @@ func (s *Server) Run() error {
 
 	s.tlsConfig = &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		MinVersion:  tls.VersionTLS10,
+		NextProtos:  []string{"http/1.1"},
 	}
 
 	log.Println("Server is listening on ports 80 (HTTP) and 443 (HTTPS)")
@@ -161,7 +171,7 @@ func (s *Server) handleHTTPS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	clientTunnel, exists := s.tunnels[tunnelID]
+	clientTunnel := s.tunnels[tunnelID]
 	s.mu.Unlock()
 
 	var service ServiceConfig
@@ -196,7 +206,16 @@ func (s *Server) forwardRequest(w http.ResponseWriter, r *http.Request, clientCo
 		},
 	}
 
-	outReq, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	targetURL := &url.URL{
+        Scheme:   "https",
+        Host:     r.Host,
+        Path:     r.URL.Path,
+        RawPath:  r.URL.RawPath,
+        RawQuery: r.URL.RawQuery,
+        Fragment: r.URL.Fragment,
+    }
+
+	outReq, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
 	if err != nil {
 		http.Error(w, "error creating forwarded request", http.StatusInternalServerError)
 		return
@@ -212,7 +231,7 @@ func (s *Server) forwardRequest(w http.ResponseWriter, r *http.Request, clientCo
 
 	resp, err := client.Do(outReq)
 	if err != nil {
-		http.Error(w, "error forwarding request", http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("error forwarding request in server: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -276,55 +295,147 @@ func (s *Server) handleConnection(conn net.Conn) {
 }
 
 func (s *Server) establishTunnel(conn net.Conn, clientRequest ReceivedRequest) {
-	tunnelID := generateUniqueID();
+    tunnelID := generateUniqueID()
+    
+    // Create new tunnel instance with monitoring channels
+    clientTunnel := &ClientTunnel{
+        conn:     conn,
+        services: clientRequest.Tunnels,
+        lastPing: time.Now(),
+        done:     make(chan struct{}),
+    }
 
-	log.Printf("Tunnels: %v", clientRequest.Tunnels)
+    // Register tunnel and services
+    s.registerTunnel(tunnelID, clientTunnel)
 
-	clientTunnel := &ClientTunnel{
-		conn: conn,
-		services: clientRequest.Tunnels,
-	}
+    // Send tunnel ID back to client
+    if err := s.sendTunnelResponse(conn, tunnelID); err != nil {
+        s.cleanupTunnel(tunnelID, clientTunnel)
+        log.Printf("Failed to send tunnel response: %v", err)
+        return
+    }
 
-	s.mu.Lock()
-	s.tunnels[tunnelID] = clientTunnel
-	for _, service := range clientRequest.Tunnels {
-		s.subdomainMap[service.Domain] = tunnelID
-	}
-	s.mu.Unlock()
+    // Start tunnel monitoring
+    go s.monitorTunnel(tunnelID, clientTunnel)
 
-	log.Printf("Connection established with ID: %s", tunnelID)
+    // Start heartbeat checker
+    go s.checkTunnelHeartbeat(tunnelID, clientTunnel)
 
-	// send tunnelID back
-	response := RequestResponse {
-		Tunnel_ID: tunnelID,
-		Error: "",
-	}
-	err := json.NewEncoder(conn).Encode(response)
-	if err != nil {
-		log.Printf("failed to encode JSON to connection: %v", err)
-	}
-	// conn.Write([]byte(tunnelID))
+    // Wait for tunnel termination
+    <-clientTunnel.done
+}
 
-	// keep the tunnel open
-	for {
-		buffer := make([]byte, 1024)
+func (s *Server) registerTunnel(tunnelID string, tunnel *ClientTunnel) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
 
-		_, err := conn.Read(buffer)
+    s.tunnels[tunnelID] = tunnel
+    for _, service := range tunnel.services {
+        s.subdomainMap[service.Domain] = tunnelID
+    }
+    
+    log.Printf("Tunnel established - ID: %s, Services: %v", tunnelID, tunnel.services)
+}
 
-		if err != nil {
-			log.Printf("Tunnel %s closed: %v", tunnelID, err)
+func (s *Server) sendTunnelResponse(conn net.Conn, tunnelID string) error {
+    response := RequestResponse{
+        Tunnel_ID: tunnelID,
+        Error:     "",
+    }
 
-			s.mu.Lock()
-			delete(s.tunnels, tunnelID)
-			for domain, id := range s.subdomainMap {
-				if id == tunnelID {
-					delete(s.subdomainMap, domain)
-				}
-			}
-			s.mu.Unlock()
-			return
-		}
-	}
+    // Set write deadline for response
+    if err := conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
+        return fmt.Errorf("failed to set write deadline: %w", err)
+    }
+    defer conn.SetWriteDeadline(time.Time{})
+
+    if err := json.NewEncoder(conn).Encode(response); err != nil {
+        return fmt.Errorf("failed to encode response: %w", err)
+    }
+
+    return nil
+}
+
+func (s *Server) monitorTunnel(tunnelID string, tunnel *ClientTunnel) {
+    defer s.cleanupTunnel(tunnelID, tunnel)
+
+    // Create a buffer pool for better memory management
+    bufferPool := sync.Pool{
+        New: func() interface{} {
+            return make([]byte, 32*1024) // 32KB buffer
+        },
+    }
+
+    for {
+        buffer := bufferPool.Get().([]byte)
+        
+        // Set read deadline for periodic connection check
+        if err := tunnel.conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+            if !isConnectionClosed(err) {
+                log.Printf("Failed to set read deadline for tunnel %s: %v", tunnelID, err)
+            }
+            bufferPool.Put(&buffer)
+            return
+        }
+
+        _, err := tunnel.conn.Read(buffer)
+        bufferPool.Put(&buffer)
+
+        if err != nil {
+            if !isConnectionClosed(err) && !strings.Contains(err.Error(), "timeout") {
+                log.Printf("Tunnel %s read error: %v", tunnelID, err)
+            }
+            return
+        }
+
+        // Update last ping time
+        tunnel.lastPing = time.Now()
+    }
+}
+
+func (s *Server) checkTunnelHeartbeat(tunnelID string, tunnel *ClientTunnel) {
+    ticker := time.NewTicker(15 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-tunnel.done:
+            return
+        case <-ticker.C:
+            if time.Since(tunnel.lastPing) > 45*time.Second {
+                log.Printf("Tunnel %s heartbeat timeout", tunnelID)
+                s.cleanupTunnel(tunnelID, tunnel)
+                return
+            }
+        }
+    }
+}
+
+func (s *Server) cleanupTunnel(tunnelID string, tunnel *ClientTunnel) {
+    tunnel.closeOnce.Do(func() {
+        // Mark as closed
+        tunnel.closed.Store(true)
+
+        // Close the connection
+        if err := tunnel.conn.Close(); err != nil && !isConnectionClosed(err) {
+            log.Printf("Error closing tunnel %s connection: %v", tunnelID, err)
+        }
+
+        // Clean up tunnel mappings
+        s.mu.Lock()
+        delete(s.tunnels, tunnelID)
+        for domain, id := range s.subdomainMap {
+            if id == tunnelID {
+                delete(s.subdomainMap, domain)
+            }
+        }
+        s.mu.Unlock()
+
+        // Signal tunnel is done
+        close(tunnel.done)
+
+        log.Printf("Tunnel %s closed and cleaned up", tunnelID)
+    })
 }
 
 func generateUniqueID() string {
@@ -335,14 +446,6 @@ func (s *Server) handleClientRequest(conn net.Conn, msg string) {
 	s.mu.Lock()
 	tunnelID := msg
 	s.mu.Unlock()
-
-	// extract
-	// tunnelID, err := s.extractTunnelID(tunnelID)
-	// if err != nil {
-	// 	log.Printf("Tunnel ID not found!")
-	// 	conn.Write([]byte("No tunnel ID was found in the request"))
-	// 	return
-	// }
 
 	err := uuid.Validate(tunnelID)
 	if err != nil {
@@ -366,39 +469,110 @@ func (s *Server) handleClientRequest(conn net.Conn, msg string) {
 }
 
 func (s *Server) handleFullDuplexCommunication(clientConn, tunnelConn net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
+    _, cancel := context.WithCancel(context.Background())
+    defer cancel()
 
-	// Create a channel to signal when it's time to close connections
-	done := make(chan struct{})
+    // Create channels for signaling when each direction is done
+    clientDone := make(chan error, 1)
+    tunnelDone := make(chan error, 1)
 
-	// client to tunnel
-	go func() {
-		defer wg.Done()
-		s.pipe(tunnelConn, clientConn, "client -> tunnel", done)
-	}()
+    // Copy from client to tunnel
+    go func() {
+        defer func() {
+            // Half-close the tunnel connection (if it implements CloseWrite)
+            if conn, ok := tunnelConn.(interface{ CloseWrite() error }); ok {
+                _ = conn.CloseWrite()
+            }
+        }()
 
-	// tunnel to client
-	go func() {
-		defer wg.Done()
-		s.pipe(clientConn, tunnelConn, "tunnel -> client", done)
-	}()
+        _, err := io.Copy(tunnelConn, clientConn)
+        if err != nil {
+            if !errors.Is(err, io.EOF) && !isConnectionClosed(err) {
+                clientDone <- fmt.Errorf("client->tunnel error: %w", err)
+                return
+            }
+        }
+        clientDone <- nil
+    }()
 
-	// Wait for both directions to complete
-	wg.Wait()
+    // Copy from tunnel to client
+    go func() {
+        defer func() {
+            // Half-close the client connection (if it implements CloseWrite)
+            if conn, ok := clientConn.(interface{ CloseWrite() error }); ok {
+                _ = conn.CloseWrite()
+            }
+        }()
 
-	// Close the connections after both directions are done
-	clientConn.Close()
-	tunnelConn.Close()
-	log.Println("Client request handled!")
+        _, err := io.Copy(clientConn, tunnelConn)
+        if err != nil {
+            if !errors.Is(err, io.EOF) && !isConnectionClosed(err) {
+                tunnelDone <- fmt.Errorf("tunnel->client error: %w", err)
+                return
+            }
+        }
+        tunnelDone <- nil
+    }()
+
+    // Helper function for graceful connection closure
+    closeConn := func(conn net.Conn) {
+        if conn != nil {
+            _ = conn.Close()
+        }
+    }
+
+    // Wait for both directions to complete and handle any errors
+    var clientErr, tunnelErr error
+    for i := 0; i < 2; i++ {
+        select {
+        case clientErr = <-clientDone:
+            if clientErr != nil {
+                cancel() // Signal other goroutine to stop
+                closeConn(tunnelConn)
+            }
+        case tunnelErr = <-tunnelDone:
+            if tunnelErr != nil {
+                cancel() // Signal other goroutine to stop
+                closeConn(clientConn)
+            }
+        }
+    }
+
+    // Ensure both connections are closed
+    closeConn(clientConn)
+    closeConn(tunnelConn)
+
+    // Log any non-connection-closed errors
+    if clientErr != nil && !isConnectionClosed(clientErr) {
+        log.Println("Error in client->tunnel direction", "error", clientErr)
+    }
+    if tunnelErr != nil && !isConnectionClosed(tunnelErr) {
+        log.Println("Error in tunnel->client direction", "error", tunnelErr)
+    }
+}
+
+// isConnectionClosed checks if the error is related to a closed connection
+// isConnectionClosed checks various connection closure conditions
+func isConnectionClosed(err error) bool {
+    if err == nil {
+        return false
+    }
+
+    return errors.Is(err, io.EOF) ||
+        errors.Is(err, net.ErrClosed) ||
+        strings.Contains(err.Error(), "use of closed network connection") ||
+        strings.Contains(err.Error(), "connection reset by peer") ||
+        strings.Contains(err.Error(), "broken pipe")
 }
 
 func (s *Server) pipe(dst, src net.Conn, direction string, done chan struct{}) {
 	defer func() {
+		log.Printf("Exiting pipe function for %s", direction)
 		select {
 		case <-done:
-			// Channel is already closed, do nothing
+			log.Printf("Done channel already closed for %s", direction)
 		default:
+			log.Printf("Closing done channel for %s", direction)
 			close(done)
 		}
 	}()
@@ -409,8 +583,13 @@ func (s *Server) pipe(dst, src net.Conn, direction string, done chan struct{}) {
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Error reading in %s: %v", direction, err)
+			} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				log.Printf("Timeout error in %s: %v", direction, err)
+				continue
+			} else {
+				log.Printf("Error reading in %s: %v", direction, err)
 			}
-			break
+			return
 		}
 		if nr > 0 {
 			nw, err := dst.Write(buf[0:nr])
@@ -423,18 +602,5 @@ func (s *Server) pipe(dst, src net.Conn, direction string, done chan struct{}) {
 				break
 			}
 		}
-
-		select {
-		case <-done:
-			return
-		default:
-			// Continue the loop
-		}
 	}
-}
-
-func (s *Server) extractTunnelID(message string) (string, error) {
-	// This function should parse the initial message and return the tunnel ID, or an error if the message is invalid.
-	// this function is protocol dependent
-	panic("Unimplemented!")
 }

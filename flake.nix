@@ -7,7 +7,7 @@
 
   outputs = { self, nixpkgs }:
     let
-      goVersion = 22; # Change this to update the whole stack
+      goVersion = 23; # Change this to update the whole stack
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forEachSupportedSystem = f: nixpkgs.lib.genAttrs supportedSystems (system: f {

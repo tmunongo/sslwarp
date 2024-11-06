@@ -1,12 +1,14 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/tmunongo/sslwarp/internal/config"
@@ -132,36 +134,95 @@ func (c *Client) handleTunnel(serverConn net.Conn) error {
 }
 
 func (c *Client) handleConnection(serverConn net.Conn, localConn net.Conn) {
-	defer localConn.Close()
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    defer serverConn.Close()
+    defer localConn.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+    errChan := make(chan error, 2)
 
-	copy := func (dst, src net.Conn)  {
-		defer wg.Done()
+    copy := func(dst, src net.Conn, direction string) {
+        defer func() {
+            // Attempt half-close if supported
+            if closer, ok := dst.(interface{ CloseWrite() error }); ok {
+                _ = closer.CloseWrite()
+            }
+            // Signal completion
+            errChan <- nil
+        }()
 
-		_, err := io.Copy(dst, src)
-		if err != nil {
-			if err != io.EOF && !isConnectionClosed(err) {
-				log.Printf("error in connection: %v", err)
-			}
-		}
-		dst.Close()
-		src.Close()
-	}
+        buf := make([]byte, 32*1024) // 32KB buffer for better performance
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            default:
+                nr, err := src.Read(buf)
+                if err != nil {
+                    if !isConnectionClosed(err) && err != io.EOF {
+                        errChan <- fmt.Errorf("%s read error: %v", direction, err)
+                    }
+                    return
+                }
+                if nr > 0 {
+                    nw, err := dst.Write(buf[0:nr])
+                    if err != nil {
+                        if !isConnectionClosed(err) {
+                            errChan <- fmt.Errorf("%s write error: %v", direction, err)
+                        }
+                        return
+                    }
+                    if nw != nr {
+                        errChan <- fmt.Errorf("%s incomplete write: %d != %d", direction, nw, nr)
+                        return
+                    }
+                }
+            }
+        }
+    }
 
-	go copy(localConn, serverConn)
-	go copy(serverConn, localConn)
+    // Start the copy operations
+    go copy(localConn, serverConn, "server->local")
+    go copy(serverConn, localConn, "local->server")
 
-	wg.Wait()
+    // Wait for both copies to complete or error
+    for i := 0; i < 2; i++ {
+        if err := <-errChan; err != nil {
+            // Only log if it's not a normal closure
+            if !isConnectionClosed(err) {
+                log.Printf("Connection error: %v", err)
+            }
+            // Cancel context to signal other goroutine to stop
+            cancel()
+        }
+    }
 }
 
+// isConnectionClosed checks various types of connection closure errors
 func isConnectionClosed(err error) bool {
-	if err == nil {
-		return false
-	}
-	if opErr, ok := err.(*net.OpError); ok {
-		return opErr.Err.Error() == "use of closed network connection"
-	}
-	return false
+    if err == nil {
+        return false
+    }
+
+    // Check for various forms of connection closure
+    if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+        return true
+    }
+
+    errStr := err.Error()
+    if strings.Contains(errStr, "use of closed network connection") ||
+        strings.Contains(errStr, "broken pipe") ||
+        strings.Contains(errStr, "connection reset by peer") ||
+        strings.Contains(errStr, "io: read/write on closed pipe") {
+        return true
+    }
+
+    // Check for operation errors
+    if opErr, ok := err.(*net.OpError); ok {
+        return opErr.Err.Error() == "use of closed network connection" ||
+            strings.Contains(opErr.Err.Error(), "broken pipe") ||
+            strings.Contains(opErr.Err.Error(), "connection reset by peer")
+    }
+
+    return false
 }
